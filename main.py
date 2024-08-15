@@ -56,6 +56,7 @@ Builder.load_string('''
 <Camera2Layout>:
     Camera2Widget:
         id: camera
+        camera_angle: root.camera_angle
         fps: root.fps
     Image:
         source: 'camera-large.png'
@@ -218,8 +219,10 @@ class PyCameraInterface(EventDispatcher):
     """
     Provides an API for querying details of the cameras available on Android.
     """
+    camera_angle = NumericProperty()
     camera_ids: list = []
     cameras: list = ListProperty()
+    fps = NumericProperty(60)
     java_camera_characteristics: dict = {}
     java_camera_manager = ObjectProperty(None, allownone=True)
 
@@ -239,9 +242,11 @@ class PyCameraInterface(EventDispatcher):
             characteristics_dict[camera_id] = camera_manager.getCameraCharacteristics(camera_id)
             Logger.debug("Got characteristics dict")
             self.cameras.append(PyCameraDevice(
+                camera_angle=self.camera_angle,
                 camera_id=camera_id,
-                java_camera_manager=camera_manager,
-                java_camera_characteristics=characteristics_dict[camera_id]))
+                fps=self.fps,
+                java_camera_characteristics=characteristics_dict[camera_id],
+                java_camera_manager=camera_manager))
             Logger.debug("Finished interpreting camera %s", camera_id)
 
     def select_cameras(self, **conditions):
@@ -323,8 +328,6 @@ class PyCameraDevice(EventDispatcher):  # pylint: disable=too-many-instance-attr
                         java_obj.clear()
                     elif hasattr(java_obj, 'release'):
                         java_obj.release()
-                    elif hasattr(java_obj, 'disable'):
-                        java_obj.disable()
                 except AttributeError as err:
                     Logger.debug('Error shutting down %s: %s', attr_name, err)
                 setattr(self, attr_name, None)
@@ -518,12 +521,15 @@ class Camera2Widget(Widget):
     target_camera = OptionProperty('BACK', options=['FRONT', 'BACK'])
     texture = ObjectProperty(None, allownone=True)
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.orientation = TiltDetector()
+
     def start_camera(self, instance=None):
         request_permissions([Permission.CAMERA], self._start_camera)
 
     def _start_camera(self, _, permissions):
         if permissions and permissions[0]:
-            self.orientation = TiltDetector()
             self._camera_interface = PyCameraInterface(fps=self.fps, camera_angle=self.camera_angle)
             self._cameras_to_use = {v.facing: v for v in self._camera_interface.cameras}
 
@@ -540,6 +546,7 @@ class Camera2Widget(Widget):
 
     def stop_camera(self, instance=None):
         if self.camera_object is not None:
+            self.orientation.disable()
             self.camera_object.close()
             self.camera_object = None
             self._camera_interface = None
