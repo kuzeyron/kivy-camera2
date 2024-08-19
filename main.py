@@ -50,7 +50,7 @@ Builder.load_string('''
         Rectangle:
             pos: self._rect_pos
             size: self._rect_size
-            texture: root.texture
+            texture: self.texture
         PopMatrix
 
 <Camera2Layout>:
@@ -79,7 +79,20 @@ Builder.load_string('''
                 width: dp(1)
                 rounded_rectangle: self.x + dp(20), self.y  + dp(20), \
                     self.width - dp(40), self.height - dp(40), dp(2)
-    CaptureButton:
+    CameraButton:
+        on_release: camera.flashlight = not camera.flashlight
+        size_hint: None, None
+        size: dp(40), dp(40)
+        pos_hint: {'center_x': .8, 'center_y': .5}
+        canvas.before:
+            Color:
+                rgba: .3, 1, .3, 1 if self.state == 'down' else .8
+            RoundedRectangle:
+                source: f'flashlight_{int(camera.flashlight)}.png'
+                size: self.size
+                pos: self.pos
+                radius: (dp(50), )
+    CameraButton:
         on_release: camera.shot()
         size_hint: None, None
         size: dp(80), dp(80)
@@ -103,7 +116,7 @@ Builder.load_string('''
 ''')
 
 
-class CaptureButton(ButtonBehavior, Widget):
+class CameraButton(ButtonBehavior, Widget):
     pass
 
 
@@ -160,6 +173,7 @@ class TiltDetector(PythonJavaClass):
 
                 if 135 > abs(roll) > 45:
                     if roll < 0 and 30 > pitch > -30:
+                        # 180 is missing
                         angle = -90  # Left
                     else:
                         if roll > 20 and 30 > pitch > -30:
@@ -216,12 +230,12 @@ class ControlAeMode(Enum):
 
 
 class PyCameraInterface(EventDispatcher):
-    """
-    Provides an API for querying details of the cameras available on Android.
-    """
+    """Provides an API for querying details of the cameras
+    available on Android."""
     camera_angle = NumericProperty()
     camera_ids: list = []
     cameras: list = ListProperty()
+    flashlight = BooleanProperty(False)
     fps = NumericProperty(60)
     java_camera_characteristics: dict = {}
     java_camera_manager = ObjectProperty(None, allownone=True)
@@ -244,6 +258,7 @@ class PyCameraInterface(EventDispatcher):
             self.cameras.append(PyCameraDevice(
                 camera_angle=self.camera_angle,
                 camera_id=camera_id,
+                flashlight=self.flashlight,
                 fps=self.fps,
                 java_camera_characteristics=characteristics_dict[camera_id],
                 java_camera_manager=camera_manager))
@@ -265,6 +280,7 @@ class PyCameraDevice(EventDispatcher):  # pylint: disable=too-many-instance-attr
     __events__ = ('on_opened', 'on_closed', 'on_disconnected', 'on_error')
     camera_angle = NumericProperty()
     camera_id = StringProperty()
+    flashlight = BooleanProperty(False)
     fps = NumericProperty(60)
     preview_texture = ObjectProperty(None, allownone=True)
     preview_resolution = ListProperty()
@@ -316,9 +332,9 @@ class PyCameraDevice(EventDispatcher):  # pylint: disable=too-many-instance-attr
             self.handler_thread = None
             self.background_handler = None
 
-        for attr_name in ['java_camera_device', 'java_capture_session',
+        for attr_name in ('java_camera_device', 'java_capture_session',
                           'java_preview_surface', 'java_capture_request',
-                          'java_surface_list', 'java_preview_surface_texture']:
+                          'java_surface_list', 'java_preview_surface_texture'):
             java_obj = getattr(self, attr_name, None)
             if java_obj is not None:
                 try:
@@ -329,7 +345,7 @@ class PyCameraDevice(EventDispatcher):  # pylint: disable=too-many-instance-attr
                     elif hasattr(java_obj, 'release'):
                         java_obj.release()
                 except AttributeError as err:
-                    Logger.debug('Error shutting down %s: %s', attr_name, err)
+                    Logger.warning('Error shutting down %s: %s', attr_name, err)
                 setattr(self, attr_name, None)
 
     def _populate_camera_characteristics(self):
@@ -418,10 +434,18 @@ class PyCameraDevice(EventDispatcher):  # pylint: disable=too-many-instance-attr
         self.java_capture_request = self.java_camera_device.createCaptureRequest(
                 CameraDevice.TEMPLATE_PREVIEW)
         self.java_capture_request.addTarget(self.java_preview_surface)
-        self.java_capture_request.set(
-            CaptureRequest.CONTROL_AF_MODE, ControlAfMode.CONTROL_AF_MODE_CONTINUOUS_PICTURE.value)
-        self.java_capture_request.set(
-            CaptureRequest.CONTROL_AE_MODE, ControlAeMode.CONTROL_AE_MODE_ON.value)
+        self.java_capture_request.set(CaptureRequest.CONTROL_AF_MODE,
+                                      ControlAfMode.CONTROL_AF_MODE_CONTINUOUS_PICTURE.value)
+        self.java_capture_request.set(CaptureRequest.CONTROL_AE_MODE,
+                                      ControlAeMode.CONTROL_AE_MODE_ON.value)
+
+        if self.flashlight and self.facing == 'BACK':
+            self.java_capture_request.set(CaptureRequest.CONTROL_AE_MODE,
+                                          CaptureRequest.CONTROL_AE_MODE_ON)
+            self.java_capture_request.set(CaptureRequest.FLASH_MODE,
+                                          CaptureRequest.FLASH_MODE_TORCH)
+            Logger.debug("Flashlight is now supposed to be on")
+
         self.java_surface_list = ArrayList()
         self.java_surface_list.add(self.java_preview_surface)
 
@@ -515,29 +539,31 @@ class Camera2Widget(Widget):
     _rect_pos = ListProperty([0, 0])
     _rect_size = ListProperty([1, 1])
     camera_angle = NumericProperty()
+    flashlight = BooleanProperty(False)
     fps = NumericProperty(60)
-    init = BooleanProperty(True)
     rotation = NumericProperty()
     target_camera = OptionProperty('BACK', options=['FRONT', 'BACK'])
     texture = ObjectProperty(None, allownone=True)
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.orientation = TiltDetector()
+        self.device_rotation = TiltDetector()
 
     def start_camera(self, instance=None):
         request_permissions([Permission.CAMERA], self._start_camera)
 
     def _start_camera(self, _, permissions):
         if permissions and permissions[0]:
-            self._camera_interface = PyCameraInterface(fps=self.fps, camera_angle=self.camera_angle)
+            self._camera_interface = PyCameraInterface(flashlight=self.flashlight,
+                                                       fps=self.fps,
+                                                       camera_angle=self.camera_angle)
             self._cameras_to_use = {v.facing: v for v in self._camera_interface.cameras}
 
             if self.target_camera in self._cameras_to_use.keys():
                 self.camera_object = self._cameras_to_use[self.target_camera]
                 rs = self.camera_object.supported_resolutions
                 self.resolution = get_suitable_camera_size(rs)
-                self.orientation.enable()
+                self.device_rotation.enable()
                 self.camera_object.open(callback=self._stream_camera_open_callback,
                                         frame_trigger=self.update)
                 return
@@ -546,7 +572,7 @@ class Camera2Widget(Widget):
 
     def stop_camera(self, instance=None):
         if self.camera_object is not None:
-            self.orientation.disable()
+            self.device_rotation.disable()
             self.camera_object.close()
             self.camera_object = None
             self._camera_interface = None
@@ -574,9 +600,12 @@ class Camera2Widget(Widget):
             self.texture = camera.start_preview(self.resolution)
 
     def update(self):
+        self.rotation = self.device_rotation.angle
         self.canvas.ask_update()
-        self.rotation = self.orientation.angle
-        self.init = False
+
+    def on_flashlight(self, instance, value):
+        self.stop_camera()
+        self.start_camera()
 
 
 class Camera2Layout(RelativeLayout):
@@ -585,6 +614,9 @@ class Camera2Layout(RelativeLayout):
 
     def start_camera(self):
         self.ids.camera.start_camera()
+
+    def stop_camera(self):
+        self.ids.camera.stop_camera()
 
 
 if __name__ == '__main__':
