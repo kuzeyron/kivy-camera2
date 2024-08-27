@@ -38,6 +38,7 @@ Surface = autoclass('android.view.Surface')
 SurfaceTexture = autoclass('android.graphics.SurfaceTexture')
 
 Builder.load_string('''
+#:import ResolutionPicker picker.ResolutionPicker
 <Camera2Widget>:
     id: camera
     canvas:
@@ -79,24 +80,49 @@ Builder.load_string('''
                 width: dp(1)
                 rounded_rectangle: self.x + dp(20), self.y  + dp(20), \
                     self.width - dp(40), self.height - dp(40), dp(2)
-    CameraButton:
-        on_release: camera.flashlight = not camera.flashlight
-        size_hint: None, None
-        size: dp(40), dp(40)
-        pos_hint: {'center_x': .8, 'center_y': .5}
+
+    BoxLayout:
+        orientation: 'vertical'
+        size_hint: .15, .6
+        pos_hint: {'right': .95, 'center_y': .5}
+        spacing: dp(5)
+        padding: dp(5), dp(5)
         canvas.before:
             Color:
-                rgba: .3, 1, .3, 1 if self.state == 'down' else .8
+                rgba: 0, 0, 0, .5
             RoundedRectangle:
-                source: f'flashlight_{int(camera.flashlight)}.png'
                 size: self.size
                 pos: self.pos
-                radius: (dp(50), )
+                radius: [dp(3), ]
+
+        ResolutionPicker:
+            pos_hint: {'center_x': .5, 'center_y': .5}
+            available_resolutions: camera.resolutions
+            selected_resolution: camera.resolution
+            on_submit:
+                camera.resolution = args[1]
+                camera.stop_camera()
+                camera.start_camera()
+        CameraButton:
+            on_release: camera.flashlight = not camera.flashlight
+            size_hint: None, None
+            size: dp(40), dp(40)
+            pos_hint: {'center_x': .5, 'center_y': .5}
+            canvas.before:
+                Color:
+                    rgba: .3, 1, .3, 1 if self.state == 'down' else .8
+                RoundedRectangle:
+                    source: f'flashlight_{int(camera.flashlight)}.png'
+                    size: self.size
+                    pos: self.pos
+                    radius: (dp(50), )
+        Widget:
+
     CameraButton:
+        pos_hint: {'center_x': .5, 'center_y': .15}
         on_release: camera.shot()
         size_hint: None, None
         size: dp(80), dp(80)
-        pos_hint: {'center_x': .5, 'center_y': .2}
         canvas.before:
             Color:
                 rgba: 0, 0, 0, .3
@@ -151,7 +177,7 @@ class TiltDetector(PythonJavaClass):
                                             SensorManager.SENSOR_DELAY_NORMAL)
         self.mGeomagnetic = [0, 0, 0]  # pylint: disable=invalid-name
         self.mGravity = [0, 0, 0]  # pylint: disable=invalid-name
-        self.angle = 90
+        self.angle = 0
 
     @java_method('(Landroid/hardware/SensorEvent;)V')
     def onSensorChanged(self, event):  # pylint: disable=invalid-name
@@ -235,8 +261,6 @@ class PyCameraInterface(EventDispatcher):
     camera_angle = NumericProperty()
     camera_ids: list = []
     cameras: list = ListProperty()
-    flashlight = BooleanProperty(False)
-    fps = NumericProperty(60)
     java_camera_characteristics: dict = {}
     java_camera_manager = ObjectProperty(None, allownone=True)
 
@@ -258,8 +282,6 @@ class PyCameraInterface(EventDispatcher):
             self.cameras.append(PyCameraDevice(
                 camera_angle=self.camera_angle,
                 camera_id=camera_id,
-                flashlight=self.flashlight,
-                fps=self.fps,
                 java_camera_characteristics=characteristics_dict[camera_id],
                 java_camera_manager=camera_manager))
             Logger.debug("Finished interpreting camera %s", camera_id)
@@ -327,7 +349,7 @@ class PyCameraDevice(EventDispatcher):  # pylint: disable=too-many-instance-attr
         self._open_callback = None
         Clock.unschedule(self._update_preview)
 
-        if self.handler_thread is not None:
+        if hasattr(self, 'handler_thread') and self.handler_thread is not None:
             self.handler_thread.quit()
             self.handler_thread = None
             self.background_handler = None
@@ -538,9 +560,11 @@ class PyCameraDevice(EventDispatcher):  # pylint: disable=too-many-instance-attr
 class Camera2Widget(Widget):
     _rect_pos = ListProperty([0, 0])
     _rect_size = ListProperty([1, 1])
-    camera_angle = NumericProperty()
+    camera_angle = NumericProperty(90)
     flashlight = BooleanProperty(False)
-    fps = NumericProperty(60)
+    fps = NumericProperty(30)
+    resolution = ListProperty()
+    resolutions = ListProperty()
     rotation = NumericProperty()
     target_camera = OptionProperty('BACK', options=['FRONT', 'BACK'])
     texture = ObjectProperty(None, allownone=True)
@@ -548,25 +572,26 @@ class Camera2Widget(Widget):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.device_rotation = TiltDetector()
+        self.camera_interface = PyCameraInterface()
+        self.cameras_to_use = {v.facing: v for v in self.camera_interface.cameras}
 
     def start_camera(self, instance=None):
         request_permissions([Permission.CAMERA], self._start_camera)
 
     def _start_camera(self, _, permissions):
-        if permissions and permissions[0]:
-            self._camera_interface = PyCameraInterface(flashlight=self.flashlight,
-                                                       fps=self.fps,
-                                                       camera_angle=self.camera_angle)
-            self._cameras_to_use = {v.facing: v for v in self._camera_interface.cameras}
+        if permissions and permissions[0] and self.target_camera in self.cameras_to_use.keys():
+            self.camera_object = self.cameras_to_use[self.target_camera]
+            self.camera_object.flashlight = self.flashlight
+            self.camera_object.camera_angle = self.camera_angle
+            self.camera_object.fps = self.fps
 
-            if self.target_camera in self._cameras_to_use.keys():
-                self.camera_object = self._cameras_to_use[self.target_camera]
-                rs = self.camera_object.supported_resolutions
-                self.resolution = get_suitable_camera_size(rs)
-                self.device_rotation.enable()
-                self.camera_object.open(callback=self._stream_camera_open_callback,
-                                        frame_trigger=self.update)
-                return
+            self.resolutions = rs = self.camera_object.supported_resolutions
+            self.resolution = self.resolution or get_suitable_camera_size(rs)
+            self.device_rotation.enable()
+
+            self.camera_object.open(callback=self._stream_camera_open_callback,
+                                    frame_trigger=self.update)
+            return
 
         Logger.warning("Can't connect with %s camera", self.target_camera)
 
@@ -575,8 +600,6 @@ class Camera2Widget(Widget):
             self.device_rotation.disable()
             self.camera_object.close()
             self.camera_object = None
-            self._camera_interface = None
-            self._cameras_to_use = {}
             self.texture = None
             collect()
 
